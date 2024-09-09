@@ -1,121 +1,156 @@
 #include <iostream>
+#include <cstdlib>
 #include <string>
-#include <fstream>
+#include <cstring>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <vector>
 #include <sstream>
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <cstring> // Include this header for strcmp
+#include <unordered_map>
+#include <thread>
+#include <fstream>
+#include <filesystem>
 
-#pragma comment(lib, "Ws2_32.lib")
+namespace fs = std::filesystem;
 
-std::string directory;
+struct HttpRequest {
+    std::string method;
+    std::string path;
+    std::string version;
+    std::string body;
+    std::unordered_map<std::string, std::string> headers;
+};
 
-void handle_client(SOCKET client_socket) {
-    char buffer[1024];
-    int bytes_received = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
-    if (bytes_received == SOCKET_ERROR) {
-        std::cerr << "Failed to read request from client\n";
-        closesocket(client_socket);
+struct HttpResponse {
+    std::string version;
+    std::string status;
+    std::string statusString;
+    std::unordered_map<std::string, std::string> headers;
+    std::string body;
+};
+
+std::string makeHttpResponse(const HttpResponse& response) {
+    std::ostringstream out;
+    const char* sep = " ";
+    const char* crlf = "\r\n";
+    out << response.version << sep << response.status << sep << response.statusString << crlf;
+    for (const auto& header : response.headers) {
+        out << header.first << ": " << header.second << crlf;
+    }
+    out << crlf << response.body;
+    return out.str();
+}
+
+HttpRequest parseHttpRequest(const std::string& request) {
+    HttpRequest httpRequest;
+    std::istringstream requestStream(request);
+    std::string line;
+    
+    // Parse the request line
+    std::getline(requestStream, line);
+    std::istringstream lineStream(line);
+    lineStream >> httpRequest.method >> httpRequest.path >> httpRequest.version;
+
+    // Parse headers
+    while (std::getline(requestStream, line) && line != "\r") {
+        auto colonPos = line.find(':');
+        if (colonPos != std::string::npos) {
+            std::string headerName = line.substr(0, colonPos);
+            std::string headerValue = line.substr(colonPos + 2);
+            httpRequest.headers[headerName] = headerValue;
+        }
+    }
+
+    // Parse body
+    while (std::getline(requestStream, line)) {
+        httpRequest.body += line + "\n";
+    }
+    return httpRequest;
+}
+
+long readFile(const std::string& filePath, std::string& content) {
+    std::ifstream file(filePath, std::ios::binary | std::ios::ate);
+    if (file.is_open()) {
+        std::ifstream::pos_type fileSize = file.tellg();
+        content.resize(fileSize);
+        file.seekg(0, std::ios::beg);
+        file.read(&content[0], fileSize);
+        file.close();
+        return fileSize;
+    }
+    return -1; // File not found
+}
+
+void handle_client(int socket_fd, const std::string& directory) {
+    std::string request;
+    char buffer[4096];
+    ssize_t bytes_received = recv(socket_fd, buffer, sizeof(buffer) - 1, 0);
+    if (bytes_received < 0) {
+        std::cerr << "Failed to receive data\n";
+        close(socket_fd);
         return;
     }
+    buffer[bytes_received] = '\0';
+    request = buffer;
 
-    buffer[bytes_received] = '\0'; // Null-terminate the buffer to treat it as a string
+    HttpRequest httpRequest = parseHttpRequest(request);
+    HttpResponse response;
+    response.version = "HTTP/1.1";
 
-    std::string request(buffer);
-    std::string response;
-    
-    // Find the end of the headers and the start of the body
-    size_t header_end = request.find("\r\n\r\n");
-    std::string headers = request.substr(0, header_end);
-    std::string body = request.substr(header_end + 4);
-
-    // Parse the request line
-    std::string request_line = request.substr(0, request.find("\r\n"));
-    std::string method = request_line.substr(0, request_line.find(' '));
-    std::string path = request_line.substr(request_line.find(' ') + 1, request_line.find(' ', request_line.find(' ') + 1) - request_line.find(' ') - 1);
-
-    if (method == "POST" && path.find("/files/") == 0) {
-        std::string filename = path.substr(7); // Extract filename from path
-
-        // Extract Content-Length header
-        size_t content_length_pos = headers.find("Content-Length: ");
-        int content_length = 0;
-        if (content_length_pos != std::string::npos) {
-            content_length = std::stoi(headers.substr(content_length_pos + 16, headers.find("\r\n", content_length_pos) - content_length_pos - 16));
-        }
-
-        // Check if the body length matches the Content-Length header
-        if (body.length() != static_cast<size_t>(content_length)) {
-            response = "HTTP/1.1 400 Bad Request\r\n\r\n";
+    std::string filePath = directory + httpRequest.path;
+    if (httpRequest.method == "GET") {
+        if (fs::exists(filePath)) {
+            std::string respBody;
+            long fileSize = readFile(filePath, respBody);
+            response.status = "200";
+            response.statusString = "OK";
+            response.headers["Content-Length"] = std::to_string(fileSize);
+            response.headers["Content-Type"] = "application/octet-stream";
+            response.body = respBody;
         } else {
-            std::string file_path = directory + filename;
-            std::ofstream file(file_path, std::ios::binary);
-
-            if (file.is_open()) {
-                file.write(body.c_str(), body.size());
-                file.close();
-                response = "HTTP/1.1 201 Created\r\n\r\n";
-            } else {
-                response = "HTTP/1.1 500 Internal Server Error\r\n\r\n";
-            }
+            response.status = "404";
+            response.statusString = "Not Found";
         }
-    } else if (method == "GET" && path.find("/files/") == 0) {
-        std::string filename = path.substr(7); // Extract filename from path
-
-        std::string file_path = directory + filename;
-        std::ifstream file(file_path, std::ios::binary | std::ios::ate);
-        
-        if (file.is_open()) {
-            std::streamsize file_size = file.tellg();
-            file.seekg(0, std::ios::beg);
-            std::string file_content(file_size, '\0');
-            
-            if (file.read(&file_content[0], file_size)) {
-                response = "HTTP/1.1 200 OK\r\n";
-                response += "Content-Type: application/octet-stream\r\n";
-                response += "Content-Length: " + std::to_string(file_size) + "\r\n";
-                response += "\r\n";
-                response += file_content;
-            } else {
-                response = "HTTP/1.1 500 Internal Server Error\r\n\r\n";
-            }
-            file.close();
-        } else {
-            response = "HTTP/1.1 404 Not Found\r\n\r\n";
-        }
+    } else if (httpRequest.method == "POST") {
+        std::ofstream outfile(filePath);
+        outfile << httpRequest.body;
+        outfile.close();
+        response.status = "201";
+        response.statusString = "Created";
     } else {
-        response = "HTTP/1.1 400 Bad Request\r\n\r\n";
+        response.status = "405";
+        response.statusString = "Method Not Allowed";
     }
 
-    // Send the HTTP response to the client
-    send(client_socket, response.c_str(), response.length(), 0);
-    std::cout << "Response sent to client\n";
-
-    closesocket(client_socket);
+    std::string http_response = makeHttpResponse(response);
+    ssize_t bytes_sent = send(socket_fd, http_response.c_str(), http_response.size(), 0);
+    if (bytes_sent < 0) {
+        std::cerr << "Failed to send data\n";
+    }
+    close(socket_fd);
 }
 
 int main(int argc, char **argv) {
     if (argc != 3 || std::strcmp(argv[1], "--directory") != 0) {
-        std::cerr << "Usage: " << argv[0] << " --directory <path>\n";
-        return 1;
-    }
-    
-    directory = argv[2];
-    // Ensure directory path ends with a '/'
-    if (directory.back() != '/') {
-        directory += '/';
-    }
-
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        std::cerr << "Failed to initialize Winsock\n";
+        std::cerr << "Usage: " << argv[0] << " --directory <directory_path>\n";
         return 1;
     }
 
-    SOCKET server_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (server_socket == INVALID_SOCKET) {
+    std::string directory = argv[2];
+    std::cout << "Serving files from directory: " << directory << "\n";
+
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
         std::cerr << "Failed to create server socket\n";
-        WSACleanup();
+        return 1;
+    }
+
+    int reuse = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+        std::cerr << "setsockopt failed\n";
         return 1;
     }
 
@@ -124,34 +159,28 @@ int main(int argc, char **argv) {
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(4221);
 
-    if (bind(server_socket, (SOCKADDR*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
+    if (bind(server_fd, (sockaddr *)&server_addr, sizeof(server_addr)) != 0) {
         std::cerr << "Failed to bind to port 4221\n";
-        closesocket(server_socket);
-        WSACleanup();
         return 1;
     }
 
-    if (listen(server_socket, SOMAXCONN) == SOCKET_ERROR) {
-        std::cerr << "Listen failed\n";
-        closesocket(server_socket);
-        WSACleanup();
+    if (listen(server_fd, 5) != 0) {
+        std::cerr << "listen failed\n";
         return 1;
     }
 
-    std::cout << "Server is listening on port 4221...\n";
-
+    std::cout << "Waiting for a client to connect...\n";
     while (true) {
-        SOCKET client_socket = accept(server_socket, nullptr, nullptr);
-        if (client_socket == INVALID_SOCKET) {
+        sockaddr_in client_addr;
+        socklen_t client_addr_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (sockaddr *)&client_addr, &client_addr_len);
+        if (client_fd < 0) {
             std::cerr << "Failed to accept client connection\n";
             continue;
         }
-
-        // Handle client request
-        handle_client(client_socket);
+        std::thread(handle_client, client_fd, directory).detach();
     }
 
-    closesocket(server_socket);
-    WSACleanup();
+    close(server_fd);
     return 0;
 }
